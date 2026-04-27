@@ -5,14 +5,14 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "Camera/CameraComponent.h"
-#include "GameFramework/FloatingPawnMovement.h"
+//#include "GameFramework/FloatingPawnMovement.h"
 #include "EnhancedInputComponent.h"
 #include "MyPlayerController.h"
 #include "Math/RotationMatrix.h"
 
 ABirdCharacter::ABirdCharacter()
 {
- 	PrimaryActorTick.bCanEverTick = false;
+ 	PrimaryActorTick.bCanEverTick = true;
 	
 	bUseControllerRotationPitch = false;
 	bUseControllerRotationYaw = false;
@@ -38,20 +38,42 @@ ABirdCharacter::ABirdCharacter()
 																// 스프링암의 끝부분을 의미하는 변수 (SocketName)
 	CameraComp->bUsePawnControlRotation = false;
 	
-	MovementComp = CreateDefaultSubobject<UFloatingPawnMovement>(TEXT("Movement"));
+	//MovementComp = CreateDefaultSubobject<UFloatingPawnMovement>(TEXT("Movement"));
 																// 로직 컴포넌트라서, 계층구조에 붙을 필요 없음
+	
+	BoxComp->SetSimulatePhysics(false);
+	SkeletalMeshComp->SetSimulatePhysics(false);		// 물리 대신 코드로 직접 제어
 	
 	// ===== 기본값 초기화 =====
 	NormalSpeed = 1200.0f;
 	SprintSpeedMultiplier = 1.7f;
 	SprintSpeed = NormalSpeed * SprintSpeedMultiplier;
+	CurrentMaxSpeed = NormalSpeed;
+	Velocity = FVector::ZeroVector;
+	InputDirection = FVector::ZeroVector;
+	bIsGrounded = false;
+	Gravity = -980.f;
+	AccelerationRate = 10.f;
+	DecelerationRate = 7.f;
+	RotationInterpSpeed = 1.f;
+	MaxPitchAngle = 45.f;
 	
+	
+	/*
 	UFloatingPawnMovement* FloatingMovement = Cast<UFloatingPawnMovement>(GetMovementComponent());
 	if (FloatingMovement)
 	{
 		FloatingMovement->MaxSpeed = NormalSpeed;
 	}															// 캐릭터 클래스에서 GetCharacterMovement()로 하는 것을
-																// 폰 클래스에서는 이렇게 함!
+																// 폰 클래스에서는 이렇게 함!*/
+}
+
+void ABirdCharacter::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	
+	UpdateMovement(DeltaSeconds);
+	
 }
 
 void ABirdCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -68,7 +90,13 @@ void ABirdCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 					PlayerController->MoveAction,
 					ETriggerEvent::Triggered,
 					this,										// 키가 눌렸을 때 호출된 함수의 객체의 포인터
-					&ABirdCharacter::Move
+					&ABirdCharacter::StartMove
+				);
+				EnhancedInput->BindAction(
+					PlayerController->MoveAction,
+					ETriggerEvent::Completed,
+					this,
+					&ABirdCharacter::StopMove
 				);
 			}
 			if (PlayerController->LookAction)
@@ -108,25 +136,103 @@ void ABirdCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 	}
 }
 
-void ABirdCharacter::Move(const FInputActionValue& value)
+void ABirdCharacter::UpdateMovement(float DeltaTime)
+{
+	// [1] 목표 속도 계산
+	FVector NormalizedInput = InputDirection.GetSafeNormal();
+	FVector TargetVelocity  = NormalizedInput * CurrentMaxSpeed;			// 속도 = 단위방향벡터 * 속력
+	
+	
+	// [2] 가속/감속 판단
+	bool bAccelerating = true;	// 가속, 감속은 입력의 유무로 알 수 있음
+	float InterpRate = bAccelerating ? AccelerationRate : DecelerationRate;	// 보간 속도
+																			// 가속 중이면 보간 속도를 AccelerationRate, 
+																			// 감속 중이면 DecelerationRate
+	
+	// [3] 속도 보간
+	Velocity = FMath::VInterpTo(Velocity, TargetVelocity, DeltaTime,InterpRate);
+	
+	AddActorWorldOffset(Velocity * DeltaTime, true);		// 컨트롤러 기준으로 움직일거라서 LocalOffset 보다는 WorldOffset으로 진행
+																			// bSweep = true 이면 가는 길을 쓸고 지나가듯 검사해서
+																			// 이동 경로 중 막히는 물체가 있으면 거기서 멈추거나 충돌 결과를 남김
+	
+	// [4] 메시 회전 처리
+	FVector HorizontalVelocity = Velocity;
+	HorizontalVelocity.Z = 0;
+	
+	bool bHasHorizontalMovement = !HorizontalVelocity.IsNearlyZero();
+	
+	if (bHasHorizontalMovement)						// 컨트롤러의 Pitch 값을 포함하여 메쉬가 이동방향을 봄. (즉, 위/아래 진행방향을 봄)
+	{
+		FRotator TargetRotation  = Velocity.Rotation(); //FVector::Rotation()은 벡터의 방향을 Pitch/Yaw로 변환
+		
+		if (TargetRotation.Pitch > 180) TargetRotation.Pitch -= 360.f; //270도 -> -90도 변경
+		if (TargetRotation.Pitch > 45.f) TargetRotation.Pitch = 45.f;
+		if (TargetRotation.Pitch < -45.f) TargetRotation.Pitch = -45.f;	//수동으로 Clamp 해주기
+		
+		
+		FRotator NewRotation = FMath::RInterpTo(	// Rotator 보간 함수, 외에도 FInterpTo(), VInterpTo()가 있음
+			GetActorRotation(),						// 현재 회전값에서 출발
+			TargetRotation,							// 목표 회전값, 이 방향으로 보간
+			DeltaTime,								// DeltaTime, 프레임레이트와 무관하게 일정한 속도로 회전하도록
+			RotationInterpSpeed						// 보간 속도(InterpSpeed), "1초에 남은 거리의 몇 배를 줄일지"
+		);
+		//NewRotation.Roll = 0.f;
+		SetActorRotation(NewRotation);
+	}	
+	else											// Q, E키로 순수 상하운동 할 때는 메쉬 회전 없이 그대로 
+	{
+		FRotator CurrentRotation = GetActorRotation();
+		if (CurrentRotation.Pitch > 180) CurrentRotation.Pitch -= 360.f; //270도 -> -90도 변경
+		
+		if (CurrentRotation.Pitch > 45.f) CurrentRotation.Pitch = 45.f;
+		if (CurrentRotation.Pitch < -45.f) CurrentRotation.Pitch = -45.f;	//수동으로 Clamp 해주기
+		
+		FRotator TargetRotation = FRotator(0.f, CurrentRotation.Yaw, 0.f);
+													// 상하 운동 시, 점진적으로 수평이 되도록
+		
+		FRotator NewRotation = FMath::RInterpTo(
+			CurrentRotation,
+			TargetRotation,	
+			DeltaTime,	
+			RotationInterpSpeed	
+		);
+		SetActorRotation(NewRotation);
+	}
+	
+	
+}
+
+void ABirdCharacter::StartMove(const FInputActionValue& value)
 {
 	if (!Controller) return;
 	// Enhanced Input에서 액션 값을 받아온 구조체에서 IA_Move의 입력값 (WASDQR) 얻기
 	const FVector MoveInput = value.Get<FVector>();
 	
+	FRotator FullRotation = Controller->GetControlRotation();
+	FVector ForwardVector = FRotationMatrix(FullRotation).GetUnitAxis(EAxis::X);	// Pitch 포함
+	
+	FRotator YawRotation(0.f,FullRotation.Yaw, 0.f);
+	FVector RightVector = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);		// Roll/Pitch 영향받지 않도록
+	
+	//UE_LOG(LogTemp, Warning, TEXT("Pitch: %f"), FullRotation.Pitch);
+	
+	/*
 	// 이동
 	// 단, 액터 기준 좌우앞뒤가 아니고, 플레이어 기준이어야 함!
-	// 상하 이동은 무조건 월드 기준
+	// 상하 이동도 무조건 월드 기준
 	float ControllerYaw = Controller->GetControlRotation().Yaw;
 	FRotator YawRotation(0.f,ControllerYaw, 0.f);
 	
-	FVector ControllerForwardVector = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
-	FVector ControllerRightVector = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+	FVector ForwardVector = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+	FVector RightVector = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+	*/
 	
 	
-	if (!FMath::IsNearlyZero(MoveInput.X))
+	/*if (!FMath::IsNearlyZero(MoveInput.X))
 	{
-		AddMovementInput(ControllerForwardVector, MoveInput.X);
+		AddMovementInput(ControllerForwardVector, MoveInput.X);				// UFloatingPawnMovement 있어야 사용 가능한 것
+		
 	}
 	if (!FMath::IsNearlyZero(MoveInput.Y))
 	{
@@ -135,24 +241,21 @@ void ABirdCharacter::Move(const FInputActionValue& value)
 	if (!FMath::IsNearlyZero(MoveInput.Z))
 	{
 		AddMovementInput(FVector::UpVector, MoveInput.Z);
-	}
+	}*/
 	
-	// 이동방향으로 자연스럽게 회전 (상하로 갈 때는 꺾이지 않음)
-	FVector Direction = MoveInput.X * ControllerForwardVector
-						+ MoveInput.Y * ControllerRightVector;
 	
-	if (!Direction.IsNearlyZero())
-	{
-		FRotator TargetRotation  = Direction.Rotation();
-		FRotator NewRotation = FMath::RInterpTo(	// Rotator 보간 함수, 외에도 FInterpTo(), VInterpTo()가 있음
-			GetActorRotation(),						// 현재 회전값에서 출발
-			TargetRotation,							// 목표 회전값, 이 방향으로 보간
-			GetWorld()->GetDeltaSeconds(),			// DeltaTime, 프레임레이트와 무관하게 일정한 속도로 회전하도록
-			7.f										// 보간 속도(InterpSpeed), "1초에 남은 거리의 몇 배를 줄일지"
-		);
-		SetActorRotation(NewRotation);
-	}
+	InputDirection = MoveInput.X * ForwardVector
+						+ MoveInput.Y * RightVector
+						+ MoveInput.Z * FVector::UpVector;					// 기존에는 "실제 이동"까지 여기서 했다면
+																			// 지금은 "이동 의도(방향)"를 저장만 함. 실제 이동은 Tick에서.
+																			// 시선 비행 + 명시적 월드 Z축 비행 
 	
+	// 기존에 여기 있던 진행 방향 바라보는 회전 보간도 UpdateMovement로 이동
+}
+
+void ABirdCharacter::StopMove(const FInputActionValue& value)
+{
+	InputDirection = FVector::ZeroVector;
 }
 
 void ABirdCharacter::Look(const FInputActionValue& value)
@@ -177,18 +280,22 @@ void ABirdCharacter::Roll(const FInputActionValue& value)
 
 void ABirdCharacter::StartSprint(const FInputActionValue& value)
 {
-	UFloatingPawnMovement* FloatingMovement = Cast<UFloatingPawnMovement>(GetMovementComponent());
+	/*UFloatingPawnMovement* FloatingMovement = Cast<UFloatingPawnMovement>(GetMovementComponent());
 	if (FloatingMovement)
 	{
 		FloatingMovement->MaxSpeed = SprintSpeed;
-	}
+	}*/
+	
+	CurrentMaxSpeed = SprintSpeed;
 }
 
 void ABirdCharacter::StopSprint(const FInputActionValue& value)
 {
-	UFloatingPawnMovement* FloatingMovement = Cast<UFloatingPawnMovement>(GetMovementComponent());
+	/*UFloatingPawnMovement* FloatingMovement = Cast<UFloatingPawnMovement>(GetMovementComponent());
 	if (FloatingMovement)
 	{
 		FloatingMovement->MaxSpeed = NormalSpeed;
-	}
+	}*/
+	
+	CurrentMaxSpeed = NormalSpeed;
 }
