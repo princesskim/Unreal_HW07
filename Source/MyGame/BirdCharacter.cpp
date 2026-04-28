@@ -19,7 +19,7 @@ ABirdCharacter::ABirdCharacter()
 	bUseControllerRotationRoll = false;							// 메쉬가 마우스에 끌려다니지 않도록
 																// 대신 캐릭터 클래스의 경우, GetCharacterMovement()->bOrientRotationToMovement = true; 로
 																// 진행방향을 자연스럽게 바라보는 것이 가능했음
-																// 폰 클래스에서는 직접 코드로 구현해줘야 함! Move 함수 쪽에 구현하겠음!
+																// 폰 클래스에서는 직접 코드로 구현해줘야 함!
 	
 	// ===== 컴포넌트 생성 및 부착 =====
 	BoxComp = CreateDefaultSubobject<UBoxComponent>(TEXT("Capsule"));
@@ -139,36 +139,51 @@ void ABirdCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 void ABirdCharacter::UpdateMovement(float DeltaTime)
 {
 	// [1] 목표 속도 계산
-	FVector NormalizedInput = InputDirection.GetSafeNormal();
+	FVector NormalizedInput = InputDirection.GetSafeNormal();				// GetSafeNormal은 내부적으로 임계값 이하면 0반환
+																			// 키보드 인풋이기 때문에 입력 강도 상관 없이 0 또는 1임.
+																			// 대각선 방향으로 갈 때 스피드가 루트2되지 않도록 정규화
+																			// StopMove에서 Completed 바인딩하고, InputDirection을 ZeroVector로 만들어주기 때문에
+																			// 키보드 환경에서는 거의 0같은 입력이 크기 1로 정규화되는 일이 없음 (안전!)
 	FVector TargetVelocity  = NormalizedInput * CurrentMaxSpeed;			// 속도 = 단위방향벡터 * 속력
 	
 	
 	// [2] 가속/감속 판단
-	bool bAccelerating = true;	// 가속, 감속은 입력의 유무로 알 수 있음
+	bool bAccelerating = !InputDirection.IsNearlyZero();					// 입력 유무로 알 수 있음 (입력 중이면 가속)
+																			// 입력이 없으면 InputDirection이 무조건 ZeroVector 이기 때문에 IsNearlyZero가 true 나옴
 	float InterpRate = bAccelerating ? AccelerationRate : DecelerationRate;	// 보간 속도
 																			// 가속 중이면 보간 속도를 AccelerationRate, 
 																			// 감속 중이면 DecelerationRate
 	
-	// [3] 속도 보간
+	// [3] 속도 보간 (+중력 적용)
 	Velocity = FMath::VInterpTo(Velocity, TargetVelocity, DeltaTime,InterpRate);
+																			// 여러 프레임에 걸쳐 목표 속도에 도달
 	
+	if (FMath::IsNearlyZero(InputDirection.Z))							// Z축 방향 운동이 없을 경우에만 중력가속도 적용
+	{
+		Velocity.Z += Gravity * DeltaTime;									// 매 초마다 중력 가속도가 쌓이도록
+	}
+	
+	
+	//UE_LOG(LogTemp, Warning, TEXT("Velocity: (%.1f, %.1f, %.1f), Z IsNearlyZero: %d"), Velocity.X, Velocity.Y, Velocity.Z,FMath::IsNearlyZero(InputDirection.Z));
+	
+	// [4] 위치 업데이트
 	AddActorWorldOffset(Velocity * DeltaTime, true);		// 컨트롤러 기준으로 움직일거라서 LocalOffset 보다는 WorldOffset으로 진행
 																			// bSweep = true 이면 가는 길을 쓸고 지나가듯 검사해서
 																			// 이동 경로 중 막히는 물체가 있으면 거기서 멈추거나 충돌 결과를 남김
 	
-	// [4] 메시 회전 처리
+	// [5] 메시 회전 처리														// 새가 부드러운 곡선으로 진행 방향 바꿈. 앞으로 가다 오른쪽으로 휙 직각 꺾임 없도록.
 	FVector HorizontalVelocity = Velocity;
 	HorizontalVelocity.Z = 0;
 	
 	bool bHasHorizontalMovement = !HorizontalVelocity.IsNearlyZero();
 	
-	if (bHasHorizontalMovement)						// 컨트롤러의 Pitch 값을 포함하여 메쉬가 이동방향을 봄. (즉, 위/아래 진행방향을 봄)
+	if (bHasHorizontalMovement)												// 컨트롤러의 Pitch 값을 포함하여 메쉬가 이동방향을 봄. (즉, 위/아래 진행방향을 봄)
 	{
-		FRotator TargetRotation  = Velocity.Rotation(); //FVector::Rotation()은 벡터의 방향을 Pitch/Yaw로 변환
+		FRotator TargetRotation  = Velocity.Rotation();						//FVector::Rotation()은 벡터의 방향을 Pitch/Yaw로 변환
 		
-		if (TargetRotation.Pitch > 180) TargetRotation.Pitch -= 360.f; //270도 -> -90도 변경
+		if (TargetRotation.Pitch > 180) TargetRotation.Pitch -= 360.f;		//270도 -> -90도 변경
 		if (TargetRotation.Pitch > 45.f) TargetRotation.Pitch = 45.f;
-		if (TargetRotation.Pitch < -45.f) TargetRotation.Pitch = -45.f;	//수동으로 Clamp 해주기
+		if (TargetRotation.Pitch < -45.f) TargetRotation.Pitch = -45.f;		//수동으로 Clamp 해주기
 		
 		
 		FRotator NewRotation = FMath::RInterpTo(	// Rotator 보간 함수, 외에도 FInterpTo(), VInterpTo()가 있음
@@ -177,19 +192,19 @@ void ABirdCharacter::UpdateMovement(float DeltaTime)
 			DeltaTime,								// DeltaTime, 프레임레이트와 무관하게 일정한 속도로 회전하도록
 			RotationInterpSpeed						// 보간 속도(InterpSpeed), "1초에 남은 거리의 몇 배를 줄일지"
 		);
-		//NewRotation.Roll = 0.f;
+		
 		SetActorRotation(NewRotation);
 	}	
-	else											// Q, E키로 순수 상하운동 할 때는 메쉬 회전 없이 그대로 
+	else																	// Q, E키로 순수 상하운동 할 때는 메쉬 회전 없이 그대로 
 	{
 		FRotator CurrentRotation = GetActorRotation();
-		if (CurrentRotation.Pitch > 180) CurrentRotation.Pitch -= 360.f; //270도 -> -90도 변경
+		if (CurrentRotation.Pitch > 180) CurrentRotation.Pitch -= 360.f;	//270도 -> -90도 변경
 		
 		if (CurrentRotation.Pitch > 45.f) CurrentRotation.Pitch = 45.f;
 		if (CurrentRotation.Pitch < -45.f) CurrentRotation.Pitch = -45.f;	//수동으로 Clamp 해주기
 		
 		FRotator TargetRotation = FRotator(0.f, CurrentRotation.Yaw, 0.f);
-													// 상하 운동 시, 점진적으로 수평이 되도록
+																			// 상하 운동 시, 점진적으로 수평이 되도록
 		
 		FRotator NewRotation = FMath::RInterpTo(
 			CurrentRotation,
@@ -206,7 +221,7 @@ void ABirdCharacter::UpdateMovement(float DeltaTime)
 void ABirdCharacter::StartMove(const FInputActionValue& value)
 {
 	if (!Controller) return;
-	// Enhanced Input에서 액션 값을 받아온 구조체에서 IA_Move의 입력값 (WASDQR) 얻기
+																			// Enhanced Input에서 액션 값을 받아온 구조체에서 IA_Move의 입력값 (WASDQR) 얻기
 	const FVector MoveInput = value.Get<FVector>();
 	
 	FRotator FullRotation = Controller->GetControlRotation();
